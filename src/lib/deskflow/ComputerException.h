@@ -11,7 +11,7 @@
 #include "base/BaseException.h"
 
 /**
- * @brief The ComputerException class, generic screen exception
+ * @brief The ComputerException class, generic computer exception
  */
 class ComputerException : public BaseException
 {
@@ -19,9 +19,9 @@ class ComputerException : public BaseException
 };
 
 /**
- * @brief ScreenOpenFailureException - Thrown when a screen cannot be opened or initialized.
+ * @brief ComputerOpenFailureException - Thrown when a computer cannot be opened or initialized.
  */
-class ScreenOpenFailureException : public ComputerException
+class ComputerOpenFailureException : public ComputerException
 {
   using ComputerException::ComputerException;
 
@@ -29,15 +29,15 @@ protected:
   QString getWhat() const throw() override;
 };
 
-//! Screen unavailable exception
+//! Computer unavailable exception
 /*!
-Thrown when a screen cannot be opened or initialized but retrying later
+Thrown when a computer cannot be opened or initialized but retrying later
 may be successful.
 */
-class ScreenUnavailableException : public ScreenOpenFailureException
+class ComputerUnavailableException : public ComputerOpenFailureException
 {
 public:
-  ~ScreenUnavailableException() throw() override = default;
+  ~ComputerUnavailableException() throw() override = default;
 
   //@}
 

@@ -9,19 +9,19 @@
 #include "deskflow/ComputerException.h"
 
 //
-// ScreenOpenFailureException
+// ComputerOpenFailureException
 //
 
-QString ScreenOpenFailureException::getWhat() const throw()
+QString ComputerOpenFailureException::getWhat() const throw()
 {
-  return format("ScreenOpenFailureException", "unable to open computer settings");
+  return format("ComputerOpenFailureException", "unable to open computer settings");
 }
 
 //
-// ScreenUnavailableException
+// ComputerUnavailableException
 //
 
-QString ScreenUnavailableException::getWhat() const throw()
+QString ComputerUnavailableException::getWhat() const throw()
 {
-  return format("ScreenUnavailableException", "unable to open computer settings");
+  return format("ComputerUnavailableException", "unable to open computer settings");
 }
