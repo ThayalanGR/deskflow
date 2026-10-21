@@ -116,7 +116,10 @@ OSXComputer::OSXComputer(IEventQueue *events, bool isPrimary, bool enableLangSyn
       m_impl(nullptr)
 {
   m_displayID = CGMainDisplayID();
-  if (!updateComputerShape(m_displayID, 0)) {
+  CGDisplayCount displayCount = 0;
+  if (CGGetActiveDisplayList(0, nullptr, &displayCount) == CGDisplayNoErr && displayCount == 0) {
+    LOG_WARN("no active display, computer shape will be set when one is activated");
+  } else if (!updateComputerShape(m_displayID, 0)) {
     throw DisplayInvalidException("failed to initialize computer shape");
   }
 
@@ -698,12 +701,6 @@ void OSXComputer::enable()
 
   if (m_isPrimary) {
     // FIXME -- start watching jump zones
-
-    // kCGEventTapOptionDefault = 0x00000000 (Missing in 10.4, so specified literally)
-    m_eventTapPort = CGEventTapCreate(
-        kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents, handleCGInputEvent,
-        this
-    );
   } else {
     // FIXME -- prevent system from entering power save mode
 
@@ -712,46 +709,65 @@ void OSXComputer::enable()
     // warp the mouse to the cursor center
     fakeMouseMove(m_xCenter, m_yCenter);
 
-    // there may be a better way to do this, but we register an event handler even if we're
-    // not on the primary display (acting as a client). This way, if a local event comes in
-    // (either keyboard or mouse), we can make sure to show the cursor if we've hidden it.
-    m_eventTapPort = CGEventTapCreate(
-        kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents,
-        handleCGInputEventSecondary, this
-    );
   }
 
-  if (m_eventTapPort) {
-    m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
-    if (m_eventTapRLSR) {
-      // Run the event tap on a dedicated thread with its own CFRunLoop so it fires
-      // independently of whatever event loop the calling thread runs (e.g. QCoreApplication).
-      // Use a semaphore to ensure m_eventTapRunLoop is set before enable() returns.
-      auto sem = dispatch_semaphore_create(0);
-      m_eventTapThread = std::thread([this, sem]() {
-        m_eventTapRunLoop = CFRunLoopGetCurrent();
-        CFRunLoopAddSource(m_eventTapRunLoop, m_eventTapRLSR, kCFRunLoopDefaultMode);
-        dispatch_semaphore_signal(sem);
-        CFRunLoopRun();
-        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
-        m_eventTapRunLoop = nullptr;
-      });
-      dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-      dispatch_release(sem);
-    } else {
-      LOG_ERR("failed to create a CFRunLoopSourceRef for the quartz event tap");
-    }
-  } else {
-    LOG_ERR("failed to create quartz event tap");
+  if (!createEventTap()) {
+    // the health timer below keeps trying; a tapless core looks healthy but
+    // captures nothing.
+    LOG_ERR("failed to create quartz event tap, will keep retrying");
+    m_eventTapDown = true;
   }
+
+  m_eventTapTimer = m_events->newTimer(1.0, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_eventTapTimer, [this](const auto &) { checkEventTap(); });
 }
 
-void OSXComputer::disable()
+// the health timer ticks once a second, so this is 30s of a dead tap before we
+// tear it down and build a new one.
+static const int kEventTapRebuildAfterTicks = 30;
+
+bool OSXComputer::createEventTap()
 {
-  showCursor();
+  // enable() isn't the only caller, so drop anything left over first.
+  releaseEventTap();
 
-  // FIXME -- stop watching jump zones, stop capturing input
+  // kCGEventTapOptionDefault = 0x00000000 (Missing in 10.4, so specified literally)
+  m_eventTapPort = CGEventTapCreate(
+      kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents,
+      m_isPrimary ? handleCGInputEvent : handleCGInputEventSecondary, this
+  );
+  if (!m_eventTapPort) {
+    return false;
+  }
 
+  m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
+  if (!m_eventTapRLSR) {
+    LOG_ERR("failed to create a CFRunLoopSourceRef for the quartz event tap");
+    CFMachPortInvalidate(m_eventTapPort);
+    CFRelease(m_eventTapPort);
+    m_eventTapPort = nullptr;
+    return false;
+  }
+
+  // Run the event tap on a dedicated thread with its own CFRunLoop so it fires
+  // independently of whatever event loop the calling thread runs (e.g. QCoreApplication).
+  // Use a semaphore to ensure m_eventTapRunLoop is set before enable() returns.
+  auto sem = dispatch_semaphore_create(0);
+  m_eventTapThread = std::thread([this, sem]() {
+    m_eventTapRunLoop = CFRunLoopGetCurrent();
+    CFRunLoopAddSource(m_eventTapRunLoop, m_eventTapRLSR, kCFRunLoopDefaultMode);
+    dispatch_semaphore_signal(sem);
+    CFRunLoopRun();
+    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
+    m_eventTapRunLoop = nullptr;
+  });
+  dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  dispatch_release(sem);
+  return true;
+}
+
+void OSXComputer::releaseEventTap()
+{
   if (m_eventTapRunLoop) {
     CFRunLoopStop(m_eventTapRunLoop);
   }
@@ -770,6 +786,59 @@ void OSXComputer::disable()
     CFRelease(m_eventTapPort);
     m_eventTapPort = nullptr;
   }
+}
+
+void OSXComputer::checkEventTap()
+{
+  if (m_eventTapPort && CGEventTapIsEnabled(m_eventTapPort)) {
+    if (m_eventTapDown) {
+      LOG_INFO("quartz event tap recovered, input capture is live again");
+      m_eventTapDown = false;
+    }
+    m_eventTapDownTicks = 0;
+    return;
+  }
+
+  if (!m_eventTapDown) {
+    LOG_WARN("quartz event tap is down, input capture is dead; rebuilding");
+    m_eventTapDown = true;
+  }
+
+  ++m_eventTapDownTicks;
+
+  // re-enabling allocates nothing, so try it every tick.
+  if (m_eventTapPort) {
+    CGEventTapEnable(m_eventTapPort, true);
+    if (CGEventTapIsEnabled(m_eventTapPort)) {
+      return;
+    }
+    // a live but disabled tap is normal while the screen is locked, so don't
+    // rebuild on every tick - that costs a mach port, a source and a thread.
+    if (m_eventTapDownTicks < kEventTapRebuildAfterTicks) {
+      return;
+    }
+  }
+
+  createEventTap();
+  m_eventTapDownTicks = 0;
+}
+
+void OSXComputer::disable()
+{
+  showCursor();
+
+  // FIXME -- stop watching jump zones, stop capturing input
+
+  // stop the health timer first or it rebuilds the tap we're dropping.
+  if (m_eventTapTimer != nullptr) {
+    m_events->removeHandler(EventTypes::Timer, m_eventTapTimer);
+    m_events->deleteTimer(m_eventTapTimer);
+    m_eventTapTimer = nullptr;
+  }
+  m_eventTapDown = false;
+  m_eventTapDownTicks = 0;
+
+  releaseEventTap();
   // FIXME -- allow system to enter power saving mode
 
   if (m_clipboardTimer != nullptr) {
@@ -1709,14 +1778,15 @@ CGEventRef OSXComputer::handleCGInputEvent(CGEventTapProxy proxy, CGEventType ty
     computer->onKey(event);
     break;
   case kCGEventTapDisabledByTimeout:
-    // Re-enable our event-tap if we still have accessibility permissions
-    if (computer->checkAXPermissions()) {
-      CGEventTapEnable(computer->m_eventTapPort, true);
-      LOG_INFO("quartz event tap was disabled by timeout, re-enabling");
-    }
-    break;
   case kCGEventTapDisabledByUserInput:
-    LOG_ERR("quartz event tap was disabled by user input");
+    // Re-enable our event-tap if we still have accessibility permissions
+    if (computer->checkAXPermissions() && computer->m_eventTapPort) {
+      CGEventTapEnable(computer->m_eventTapPort, true);
+      LOG_INFO(
+          "quartz event tap was disabled by %s, re-enabling",
+          type == kCGEventTapDisabledByTimeout ? "timeout" : "user input"
+      );
+    }
     break;
   case NX_NULLEVENT:
     break;

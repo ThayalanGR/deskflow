@@ -86,6 +86,9 @@ public:
   void leave() override;
   bool setClipboard(ClipboardID, const IClipboard *) override;
   void checkClipboards() override;
+  bool createEventTap();
+  void releaseEventTap();
+  void checkEventTap();
   void openScreensaver(bool notify) override;
   void closeScreensaver() override;
   void screensaver(bool activate) override;
@@ -229,9 +232,12 @@ private:
 
   uint32_t m_activeSides = 0;
   // screen shape stuff
-  int32_t m_x, m_y;
-  int32_t m_w, m_h;
-  int32_t m_xCenter, m_yCenter;
+  int32_t m_x = 0;
+  int32_t m_y = 0;
+  int32_t m_w = 0;
+  int32_t m_h = 0;
+  int32_t m_xCenter = 0;
+  int32_t m_yCenter = 0;
 
   // mouse state
   mutable int32_t m_xCursor, m_yCursor;
@@ -304,6 +310,9 @@ private:
   CFRunLoopSourceRef m_eventTapRLSR;
   std::thread m_eventTapThread;
   CFRunLoopRef m_eventTapRunLoop = nullptr;
+  EventQueueTimer *m_eventTapTimer = nullptr;
+  bool m_eventTapDown = false;
+  int m_eventTapDownTicks = 0;
 
   // for double click coalescing.
   double m_lastClickTime;
