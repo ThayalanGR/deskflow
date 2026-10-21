@@ -107,7 +107,13 @@ OSXScreen::OSXScreen(IEventQueue *events, bool isPrimary, bool enableLangSync)
 {
   m_displayID = CGMainDisplayID();
   if (!updateScreenShape(m_displayID, 0)) {
-    throw DisplayInvalidException("failed to initialize screen shape");
+    // Not fatal. CGGetActiveDisplayList reports no active displays while every
+    // display is asleep, which can last as long as the machine stays idle, so
+    // this fails routinely for any start that lands while the screen is off.
+    // displayReconfigurationCallback(), registered below, refreshes the shape
+    // when a display returns and already treats the identical failure as
+    // non-fatal. Throwing here instead killed the process on every such start.
+    LOG_WARN("no active display at startup; screen shape will be set when a display appears");
   }
 
   try {
@@ -660,12 +666,6 @@ void OSXScreen::enable()
 
   if (m_isPrimary) {
     // FIXME -- start watching jump zones
-
-    // kCGEventTapOptionDefault = 0x00000000 (Missing in 10.4, so specified literally)
-    m_eventTapPort = CGEventTapCreate(
-        kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents, handleCGInputEvent,
-        this
-    );
   } else {
     // FIXME -- prevent system from entering power save mode
 
@@ -673,36 +673,69 @@ void OSXScreen::enable()
 
     // warp the mouse to the cursor center
     fakeMouseMove(m_xCenter, m_yCenter);
-
-    // there may be a better way to do this, but we register an event handler even if we're
-    // not on the primary display (acting as a client). This way, if a local event comes in
-    // (either keyboard or mouse), we can make sure to show the cursor if we've hidden it.
-    m_eventTapPort = CGEventTapCreate(
-        kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents,
-        handleCGInputEventSecondary, this
-    );
   }
 
-  if (m_eventTapPort) {
-    m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
-    if (m_eventTapRLSR) {
-      CFRunLoopAddSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
-    } else {
-      LOG_ERR("failed to create a CFRunLoopSourceRef for the quartz event tap");
-    }
-  } else {
-    LOG_ERR("failed to create quartz event tap");
+  if (!createEventTap()) {
+    // Not fatal, and no longer permanent. CGEventTapCreate fails transiently
+    // around wake, and the old code left the process running tapless for good:
+    // input capture dead while the connection still looked healthy. The health
+    // timer below rebuilds the tap as soon as the system allows it.
+    LOG_ERR("failed to create quartz event tap, will keep retrying");
+    m_eventTapDown = true;
   }
+
+  m_eventTapTimer = m_events->newTimer(1.0, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_eventTapTimer, [this](const auto &) { checkEventTap(); });
 }
 
-void OSXScreen::disable()
+bool OSXScreen::createEventTap()
 {
-  showCursor();
+  // Drop anything left over first. enable() can run more than once over the
+  // life of the screen, and an orphaned run loop source keeps delivering
+  // callbacks that reference a port we have already released.
+  releaseEventTap();
 
-  // FIXME -- stop watching jump zones, stop capturing input
+  // kCGEventTapOptionDefault = 0x00000000 (Missing in 10.4, so specified literally)
+  // The secondary callback is installed even when acting as a client so that a
+  // local event can un-hide the cursor.
+  m_eventTapPort = CGEventTapCreate(
+      kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, kCGEventMaskForAllEvents,
+      m_isPrimary ? handleCGInputEvent : handleCGInputEventSecondary, this
+  );
+  if (!m_eventTapPort) {
+    return false;
+  }
 
+  m_eventTapRLSR = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, m_eventTapPort, 0);
+  if (!m_eventTapRLSR) {
+    LOG_ERR("failed to create a CFRunLoopSourceRef for the quartz event tap");
+    CFRelease(m_eventTapPort);
+    m_eventTapPort = nullptr;
+    return false;
+  }
+
+  // The tap MUST be attached to the main run loop, not to whichever run loop
+  // happens to belong to the calling thread. enable() runs on the main thread,
+  // so the original CFRunLoopGetCurrent() was correct there, but checkEventTap()
+  // is driven by the event queue timer and need not be. A source added to an
+  // unserviced run loop never delivers: the callback stops responding and macOS
+  // disables the tap on timeout a few seconds later, which produced a rebuild
+  // loop of recover-then-die every ~3s. A crash report confirmed the tap is
+  // serviced on com.apple.main-thread. CFRunLoopAddSource is thread safe.
+  CFRunLoopAddSource(CFRunLoopGetMain(), m_eventTapRLSR, kCFRunLoopDefaultMode);
+  CFRunLoopWakeUp(CFRunLoopGetMain());
+
+  if (!pthread_main_np()) {
+    LOG_DEBUG("quartz event tap rebuilt off the main thread; source attached to the main run loop");
+  }
+  return true;
+}
+
+void OSXScreen::releaseEventTap()
+{
   if (m_eventTapRLSR) {
-    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), m_eventTapRLSR, kCFRunLoopDefaultMode);
+    // Must match the run loop createEventTap() added it to.
+    CFRunLoopRemoveSource(CFRunLoopGetMain(), m_eventTapRLSR, kCFRunLoopDefaultMode);
     CFRelease(m_eventTapRLSR);
     m_eventTapRLSR = nullptr;
   }
@@ -712,6 +745,71 @@ void OSXScreen::disable()
     CFRelease(m_eventTapPort);
     m_eventTapPort = nullptr;
   }
+}
+
+// The health timer ticks once a second, so this is 30s of a dead-but-present
+// tap before it is torn down and rebuilt.
+static const int kEventTapRebuildAfterTicks = 30;
+
+void OSXScreen::checkEventTap()
+{
+  if (m_eventTapPort && CGEventTapIsEnabled(m_eventTapPort)) {
+    if (m_eventTapDown) {
+      LOG_INFO("quartz event tap recovered, input capture is live again");
+      m_eventTapDown = false;
+    }
+    m_eventTapDownTicks = 0;
+    return;
+  }
+
+  // Log the transition only, not every tick.
+  if (!m_eventTapDown) {
+    LOG_WARN("quartz event tap is down, input capture is dead; rebuilding");
+    m_eventTapDown = true;
+  }
+
+  ++m_eventTapDownTicks;
+
+  // Cheapest repair first: the port is alive and merely switched off. This
+  // allocates nothing, so it is tried on every tick.
+  if (m_eventTapPort) {
+    CGEventTapEnable(m_eventTapPort, true);
+    if (CGEventTapIsEnabled(m_eventTapPort)) {
+      return; // next tick reports the recovery
+    }
+
+    // Still off with a live port. That is the normal state while the screen is
+    // locked: secure input holds the tap off and no amount of re-enabling takes
+    // until unlock. Rebuilding every second through a locked night would be
+    // tens of thousands of needless mach port and run loop source allocations,
+    // so only rebuild once the tap has stayed dead long enough to look broken
+    // rather than merely suppressed. A null port means creation itself failed,
+    // which is the transient wake case, and that retries on every tick.
+    if (m_eventTapDownTicks < kEventTapRebuildAfterTicks) {
+      return;
+    }
+  }
+
+  createEventTap();
+  m_eventTapDownTicks = 0;
+}
+
+void OSXScreen::disable()
+{
+  showCursor();
+
+  // FIXME -- stop watching jump zones, stop capturing input
+
+  // uninstall the tap health timer before the tap itself, so it cannot fire
+  // against a half-torn-down screen and resurrect the tap we are dropping.
+  if (m_eventTapTimer != nullptr) {
+    m_events->removeHandler(EventTypes::Timer, m_eventTapTimer);
+    m_events->deleteTimer(m_eventTapTimer);
+    m_eventTapTimer = nullptr;
+  }
+  m_eventTapDown = false;
+
+  releaseEventTap();
   // FIXME -- allow system to enter power saving mode
 
   // uninstall clipboard timer
@@ -1658,14 +1756,25 @@ CGEventRef OSXScreen::handleCGInputEvent(CGEventTapProxy proxy, CGEventType type
   case kCGEventFlagsChanged:
     screen->onKey(event);
     break;
+  // Secure input disables the tap and the lock screen engages secure input, so
+  // the user-input case fires on every display-off. Without re-enabling, input
+  // capture stays dead for the life of the process while the connection still
+  // looks healthy.
   case kCGEventTapDisabledByTimeout:
-    // Re-enable our event-tap
-    CGEventTapEnable(screen->m_eventTapPort, true);
-    LOG_INFO("quartz event tap was disabled by timeout, re-enabling");
+  case kCGEventTapDisabledByUserInput: {
+    const char *reason = (type == kCGEventTapDisabledByTimeout) ? "timeout" : "user input";
+    // m_eventTapPort can be null here: an orphaned run loop source still
+    // delivers this after enable() failed to recreate the tap. CGEventTapEnable
+    // dereferences the port, so an unguarded call is a null dereference
+    // (observed as EXC_BAD_ACCESS at 0x8 inside CFMachPortGetContext).
+    if (screen->m_eventTapPort) {
+      CGEventTapEnable(screen->m_eventTapPort, true);
+      LOG_INFO("quartz event tap was disabled by %s, re-enabling", reason);
+    } else {
+      LOG_WARN("quartz event tap was disabled by %s but the tap port is gone", reason);
+    }
     break;
-  case kCGEventTapDisabledByUserInput:
-    LOG_ERR("quartz event tap was disabled by user input");
-    break;
+  }
   case NX_NULLEVENT:
     break;
   default:

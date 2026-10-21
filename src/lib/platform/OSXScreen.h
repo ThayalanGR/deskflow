@@ -84,6 +84,12 @@ public:
   void leave() override;
   bool setClipboard(ClipboardID, const IClipboard *) override;
   void checkClipboards() override;
+  //! Create the quartz event tap and install its run loop source
+  bool createEventTap();
+  //! Remove and release the quartz event tap and its run loop source
+  void releaseEventTap();
+  //! Rebuild the quartz event tap if it has died
+  void checkEventTap();
   void openScreensaver(bool notify) override;
   void closeScreensaver() override;
   void screensaver(bool activate) override;
@@ -225,9 +231,12 @@ private:
 
   uint32_t m_activeSides = 0;
   // screen shape stuff
-  int32_t m_x, m_y;
-  int32_t m_w, m_h;
-  int32_t m_xCenter, m_yCenter;
+  // Zero-initialised: the screen shape is unknown until a display exists.
+  // updateScreenShape() fills these in, and may legitimately fail at startup
+  // when every display is asleep.
+  int32_t m_x = 0, m_y = 0;
+  int32_t m_w = 0, m_h = 0;
+  int32_t m_xCenter = 0, m_yCenter = 0;
 
   // mouse state
   mutable int32_t m_xCursor, m_yCursor;
@@ -292,6 +301,16 @@ private:
   // Quartz input event support
   CFMachPortRef m_eventTapPort;
   CFRunLoopSourceRef m_eventTapRLSR;
+  // Polls the tap and rebuilds it when it dies. The tap can be lost in ways no
+  // callback reports: CGEventTapCreate failing in enable() after a resume, or
+  // the tap being switched off while the callback (which only runs on a live
+  // tap) has no chance to re-enable it.
+  EventQueueTimer *m_eventTapTimer = nullptr;
+  bool m_eventTapDown = false;
+  // Consecutive health-check ticks with the tap down, used to rate-limit the
+  // rebuild. Re-enabling costs nothing and is tried every tick; rebuilding
+  // allocates a mach port and a run loop source, so it waits.
+  int m_eventTapDownTicks = 0;
 
   // for double click coalescing.
   double m_lastClickTime;
